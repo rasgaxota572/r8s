@@ -96,6 +96,7 @@ jobs:
       - name: Setup KSUN
         run: |
           echo "Setting up KSUN..."
+          rm -r KernelSU-Next
           curl -LSs "https://raw.githubusercontent.com/kerjarodipp-glitch/SukiSU-Ultra/refs/heads/susfs-main/kernel/setup.sh" | bash -s susfs-main
 
       - name: Build Kernel-With-KernelSU
