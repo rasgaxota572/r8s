@@ -1,3 +1,3 @@
-[submodule "KernelSU"]
-	path = KernelSU
-	url = https://github.com/kerjarodipp-glitch/SukiSU-Ultra
+[submodule "KernelSU-Next"]
+	path = KernelSU-Next
+	url = https://github.com/alessandroaraujo5/KernelSU-Next
