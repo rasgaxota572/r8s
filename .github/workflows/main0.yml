@@ -47,7 +47,6 @@ jobs:
           aria2c -x 16 -s 16 -k 1M "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r547379.tar.gz" -o clang-r547379.tar.gz
           tar -xzf clang-r547379.tar.gz -C aosp-clang
           rm clang-r547379.tar.gz
-          rm -r KernelSU-next
           echo "✅ AOSP Clang r547379 extracted successfully."
      
       - name: Get Build Information
