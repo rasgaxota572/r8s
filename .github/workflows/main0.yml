@@ -1,0 +1,235 @@
+name: Build Kernel (4.19)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * 6"
+  push:
+    branches:
+      - HEAD
+  pull_request:
+    branches:
+      - HEAD
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_MAXSIZE: "2G"
+      CCACHE_HARDLINK: "true"
+      KERNEL_DEFCONFIG: "extreme_r8s_defconfig"
+      KERNEL_CMDLINE: "ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- O=out"
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: "true"
+          fetch-depth: 100
+
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt install gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi -y
+          sudo apt install aria2 binutils make python3 libssl-dev build-essential bc bison flex unzip libssl-dev ca-certificates xz-utils mkbootimg cpio device-tree-compiler git git-lfs curl wget jq gzip -y
+
+      - name: Download AOSP Clang r547379
+        run: |
+          echo "📦 Downloading AOSP Clang r547379..."
+          mkdir -p aosp-clang
+          aria2c -x 16 -s 16 -k 1M "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r547379.tar.gz" -o clang-r547379.tar.gz
+          tar -xzf clang-r547379.tar.gz -C aosp-clang
+          rm clang-r547379.tar.gz
+          rm -r KernelSU-next
+          echo "✅ AOSP Clang r547379 extracted successfully."
+     
+      - name: Get Build Information
+        id: build_info
+        run: |
+          KERNEL_VERSION=$(make kernelversion 2>/dev/null || echo "Unknown")
+          echo "kernel_version=${KERNEL_VERSION}" >> $GITHUB_OUTPUT
+
+          export PATH=$(pwd)/aosp-clang/bin/:$PATH
+          CLANG_VERSION=$(clang --version | head -n1)
+          echo "clang_version=${CLANG_VERSION}" >> $GITHUB_OUTPUT
+
+          BRANCH_NAME=${GITHUB_REF##*/}
+          echo "branch=${BRANCH_NAME}" >> $GITHUB_OUTPUT
+
+          COMMIT_MSG=$(git log -1 --pretty=%B | head -n1)
+          COMMIT_SHA=$(git rev-parse --short HEAD)
+          echo "commit_msg=${COMMIT_MSG}" >> $GITHUB_OUTPUT
+          echo "commit_sha=${COMMIT_SHA}" >> $GITHUB_OUTPUT
+
+          BUILD_START=$(date '+%Y-%m-%d %H:%M:%S UTC')
+          echo "build_start=${BUILD_START}" >> $GITHUB_OUTPUT
+          echo "build_start_ts=$(date +%s)" >> $GITHUB_OUTPUT
+
+      - name: Send Build Start Notification
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d parse_mode="HTML" \
+            -d text="🔨 <b>Kernel Build Started</b>
+            📱 <b>Device:</b> Spesn (4.19)
+            🌿 <b>Branch:</b> <code>${{ steps.build_info.outputs.branch }}</code>
+            📝 <b>Commit:</b> <code>${{ steps.build_info.outputs.commit_sha }}</code>
+
+            🐧 <b>Linux:</b> ${{ steps.build_info.outputs.kernel_version }}
+            🔧 <b>Compiler:</b> AOSP Clang r547379
+            ⏰ <b>Started:</b> ${{ steps.build_info.outputs.build_start }}
+
+            ⚙️ Building kernel with SukiSU + SUSFS + OverClock 🔥🔥🔥"
+
+      - name: Apply OC patch (2.6GHz/2.2GHz)
+        run: |
+          echo "Applying 2.6GHz/2.2GHz overclock patch..."
+          git apply oc_26_22_bengal.patch || echo "Patch already applied"
+
+      - name: Setup KSUN
+        run: |
+          echo "Setting up KSUN..."
+          curl -LSs "https://raw.githubusercontent.com/kerjarodipp-glitch/SukiSU-Ultra/refs/heads/susfs-main/kernel/setup.sh" | bash -s susfs-main
+
+      - name: Build Kernel-With-KernelSU
+        id: build_kernel
+        run: |
+          export PATH=$(pwd)/aosp-clang/bin/:$PATH
+          echo "Starting kernel build..."
+          BUILD_START=$(date +%s)
+          make $KERNEL_CMDLINE $KERNEL_DEFCONFIG CC="ccache clang" 2>&1 | tee build_config.log
+          make $KERNEL_CMDLINE CC="ccache clang" -j$(nproc --all) 2>&1 | tee build.log
+          BUILD_END=$(date +%s)
+          BUILD_TIME=$((BUILD_END - BUILD_START))
+          BUILD_TIME_MIN=$((BUILD_TIME / 60))
+          BUILD_TIME_SEC=$((BUILD_TIME % 60))
+          echo "build_time=${BUILD_TIME_MIN}m ${BUILD_TIME_SEC}s" >> $GITHUB_OUTPUT
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: Patch kernel from Image.gz
+        run: |
+          cd out/arch/arm64/boot
+
+          echo "📦 Extracting Image.gz → Image..."
+          gunzip -c Image.gz > Image
+
+          echo "📥 Downloading patch tool..."
+          wget -q https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.12.2/patch_linux
+
+          echo "🔧 Applying kernel patch..."
+          chmod +x patch_linux
+          ./patch_linux
+
+          echo "🧹 Cleaning old files and renaming..."
+          rm -rf Image* || true
+          mv oImage Image
+
+          echo "📦 Compressing patched Image → Image.gz..."
+          gzip -c Image > Image.gz
+
+          echo "✅ Patching complete!"
+
+      - name: Pack AnyKernel3 ZIP
+        if: success()
+        id: pack_anykernel3
+        run: |
+         echo "📦 Cloning AnyKernel3..."
+         git clone --depth=1 https://github.com/Vynxid/AnyKernel3.git AnyKernel3
+         cd AnyKernel3
+         cp ../out/arch/arm64/boot/Image.gz .
+         cp ../out/arch/arm64/boot/dtbo.img . 2>/dev/null || echo "⚠️ No dtbo.img found, skipping."
+         ZIP_NAME="kranul.zip"
+         zip -r9 "../${ZIP_NAME}" ./*
+         cd ..
+         echo "✅ AnyKernel3 package created: ${ZIP_NAME}"
+         echo "zip_name=${ZIP_NAME}" >> $GITHUB_OUTPUT
+ 
+      - name: Prepare Build Logs
+        if: always()
+        run: |
+          cat > build_summary.txt << EOF
+          ═══════════════════════════════════════
+                       KERNEL BUILD SUMMARY
+          ═══════════════════════════════════════
+
+          Build Configuration:
+          • Linux Version: ${{ steps.build_info.outputs.kernel_version }}
+          • Compiler: AOSP Clang r547379
+          • Branch: ${{ steps.build_info.outputs.branch }}
+          • Commit: ${{ steps.build_info.outputs.commit_sha }}
+
+          Build Details:
+          • Started: ${{ steps.build_info.outputs.build_start }}         
+          • Duration: ${{ steps.build_kernel.outputs.build_time }}
+          • Status: ${{ steps.build_kernel.outputs.status || 'failed' }}
+
+          Features:
+          • SukiSU: Enabled
+          • SUSFS: Enabled
+          • Litte Little OC
+          • Enable KPM
+          ═══════════════════════════════════════
+           EOF
+          echo "" >> build_summary.txt
+          echo "Last 50 lines of build log:" >> build_summary.txt
+          tail -n 50 build.log >> build_summary.txt || echo "No build log available" >> build_summary.txt
+
+      - name: Get File Sizes
+        if: success()
+        id: file_info
+        run: |
+          IMAGE_SIZE=$(du -h out/arch/arm64/boot/Image.gz | cut -f1)
+          DTBO_SIZE=$(du -h out/arch/arm64/boot/dtbo.img | cut -f1)
+          echo "image_size=${IMAGE_SIZE}" >> $GITHUB_OUTPUT
+          echo "dtbo_size=${DTBO_SIZE}" >> $GITHUB_OUTPUT
+
+      - name: Send Success Notification with Files
+        if: success()
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d parse_mode="HTML" \
+            -d text="✅ <b>Kernel Build Successful!</b>
+
+            📱 <b>Device:</b> Spesn (4.19)
+            🌿 <b>Branch:</b> <code>${{ steps.build_info.outputs.branch }}</code>
+            📝 <b>Commit:</b> <code>${{ steps.build_info.outputs.commit_sha }}</code>
+
+            🐧 <b>Linux:</b> ${{ steps.build_info.outputs.kernel_version }}
+            🔧 <b>Compiler:</b> AOSP Clang r547379
+            ⏱ <b>Build Time:</b> ${{ steps.build_kernel.outputs.build_time }}
+
+           📦 <b>Output Files:</b>
+            • Image.gz: ${{ steps.file_info.outputs.image_size }}
+            • dtbo.img: ${{ steps.file_info.outputs.dtbo_size }}
+
+           ✨ Features: SukiSU-SUSFS-KPM-OC"
+
+      - name: Send AnyKernel3 ZIP to Telegram
+        if: success()
+        run: |
+         curl -F chat_id="${TELEGRAM_CHAT_ID}" \
+         -F document=@"${{ steps.pack_anykernel3.outputs.zip_name }}" \
+         -F caption="📦 <b>kranul.zip</b>\n\n✅ Build success on <code>${{ steps.build_info.outputs.branch }}</code>!\n\n🔥 Features: SukiSU + SUSFS + OverClock" \
+         -F parse_mode="HTML" \
+         "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument"
+
+
+      - name: Upload Artifacts (Backup)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kernel-Build-${{ steps.build_info.outputs.commit_sha }}
+          path: |
+            out/arch/arm64/boot/Image.gz
+            out/arch/arm64/boot/dtbo.img
+            build_summary.txt
+            ${{ steps.pack_anykernel3.outputs.zip_name }}
+          retention-days: 7
